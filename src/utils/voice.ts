@@ -5,9 +5,30 @@ import {
   createAudioResource,
   AudioPlayerStatus,
   StreamType,
+  VoiceConnectionStatus,
+  entersState,
+  getVoiceConnection,
 } from "@discordjs/voice";
-import { join } from "path";
-import type { ClientType } from "~/types.js";
+import { existsSync } from "fs";
+import { dirname, isAbsolute, join } from "path";
+import { fileURLToPath } from "url";
+import type { ClientType } from "../types.ts";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+function resolveAudioPath(filename: string): string {
+  if (isAbsolute(filename)) {
+    return filename;
+  }
+
+  const cwdPath = join(process.cwd(), filename);
+  if (existsSync(cwdPath)) {
+    return cwdPath;
+  }
+
+  return join(__dirname, "..", "..", filename);
+}
 
 /**
  * Gets all voice channels in a guild
@@ -29,33 +50,122 @@ export function hasMembers(channel: VoiceChannel): boolean {
  * Joins a voice channel
  */
 export function joinChannel(channel: VoiceChannel) {
-  return joinVoiceChannel({
+  const existingConnection = getVoiceConnection(channel.guild.id);
+  
+  // Return existing connection if it's already in this channel
+  if (existingConnection && existingConnection.joinConfig.channelId === channel.id) {
+    return existingConnection;
+  }
+  
+  // Only destroy if it exists and is not reconnecting
+  if (existingConnection) {
+    const status = existingConnection.state.status;
+    if (status !== VoiceConnectionStatus.Destroyed && 
+        status !== VoiceConnectionStatus.Signalling &&
+        status !== VoiceConnectionStatus.Connecting) {
+      console.error(`[Voice Join] Destroying existing ${status} connection to ${channel.name}`);
+      try {
+        existingConnection.destroy();
+      } catch {}
+    }
+  }
+
+  console.error(`[Voice Join] Creating new connection to ${channel.name} (${channel.id}) in guild ${channel.guild.id}`);
+  const connection = joinVoiceChannel({
     channelId: channel.id,
     guildId: channel.guild.id,
     adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: true,
+    selfMute: false,
   });
+
+  // Attach debug and error listeners immediately
+  connection.on("debug", (message) => {
+    console.error(`[Voice Debug] ${message}`);
+  });
+
+  connection.on("error", (error) => {
+    console.error(`[Voice Error] ${channel.name}: ${error.message}`);
+  });
+
+  return connection;
 }
 
 /**
  * Plays an MP3 file in a voice channel
  */
 export async function playAudio(channel: VoiceChannel, filename: string) {
+  const filePath = resolveAudioPath(filename);
+  console.error(`[Voice Play] Resolved audio path: ${filePath}`);
+  if (!existsSync(filePath)) {
+    throw new Error(`Audio file not found: ${filePath}`);
+  }
+
   const connection = joinChannel(channel);
-  const player = createAudioPlayer();
-  const resource = createAudioResource(join(process.cwd(), filename));
 
-  connection.subscribe(player);
-  console.log("Subscribed to player");
-  player.play(resource);
-  console.log("Playing audio");
+  const destroyConnection = () => {
+    if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      try {
+        connection.destroy();
+      } catch (error) {
+        console.error("Failed to destroy voice connection:", error);
+      }
+    }
+  };
 
-  return new Promise((resolve) => {
-    player.on(AudioPlayerStatus.Idle, () => {
-      console.log("Idle");
-      connection.destroy();
-      resolve(true);
-    });
+  // Log state changes to help debug
+  connection.on("stateChange", (oldState, newState) => {
+    console.error(`[Voice State] ${channel.name}: ${oldState.status} -> ${newState.status}`);
   });
+
+  // Enable library debug logging
+  connection.on("debug", (message) => {
+    console.error(`[Voice Debug] ${message}`);
+  });
+
+  const checkInterval = setInterval(() => {
+    if (connection.state.status !== VoiceConnectionStatus.Ready &&
+        connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      console.error(`[Voice Check] Still ${connection.state.status} in ${channel.name}...`);
+    }
+  }, 5000);
+
+  // Wait for connection to be ready
+  await entersState(connection, VoiceConnectionStatus.Ready, 60_000);
+  console.error(`[Voice] Connection is ready!`);
+
+  const player = createAudioPlayer();
+  const resource = createAudioResource(filePath, {
+    inputType: StreamType.Mp3,
+  });
+  const subscription = connection.subscribe(player);
+
+  if (!subscription) {
+    destroyConnection();
+    throw new Error(`Failed to subscribe to player in ${channel.name}`);
+  }
+
+  player.play(resource);
+
+  // Monitor player errors
+  player.on("error", (error) => {
+    console.error(`AudioPlayer error in ${channel.name}:`, error.message, error.resource);
+  });
+
+  try {
+    console.error(`[Voice Play] Waiting for player to start in ${channel.name}...`);
+    await entersState(player, AudioPlayerStatus.Playing, 35_000);
+    console.error(`[Voice Play] Audio started in ${channel.name}!`);
+    await entersState(player, AudioPlayerStatus.Idle, 120_000);
+    return true;
+  } catch (error) {
+    console.error(`playAudio failed in ${channel.name}:`, error);
+    return false;
+  } finally {
+    clearInterval(checkInterval);
+    subscription.unsubscribe();
+    destroyConnection();
+  }
 }
 
 export async function playAudioPlaylist(
@@ -68,6 +178,18 @@ export async function playAudioPlaylist(
   if (filenames.length === 0) return;
 
   const connection = joinChannel(channel);
+
+  // Wait for connection to be ready before proceeding
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  } catch (error) {
+    console.error(`Playlist connection failed in ${channel.name}:`, error);
+    if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      connection.destroy();
+    }
+    return;
+  }
+
   const player = createAudioPlayer();
   (channel.client as ClientType).players.set(channel.guild.id, player);
   console.log("Player created");
@@ -80,7 +202,6 @@ export async function playAudioPlaylist(
     console.log(`Playing ${filename}`);
     console.log(filePath);
 
-    // Create a fresh audio resource each time
     const resource = createAudioResource(filePath, {
       inputType: StreamType.Arbitrary,
       metadata: {
@@ -95,30 +216,24 @@ export async function playAudioPlaylist(
     player.play(resource);
   }
 
-  // Set up event listeners
   player.on(AudioPlayerStatus.Playing, () => {
     console.log("Audio started playing");
   });
 
   player.on(AudioPlayerStatus.Idle, () => {
     console.log("Audio finished, moving to next");
-
-    // Small delay before playing next song
     setTimeout(() => {
       playRandomSong();
     }, 500);
   });
 
-  // Handle errors
   player.on("error", (error) => {
     console.error("Audio player error:", error);
-
     setTimeout(() => {
       playRandomSong();
     }, 500);
   });
 
-  // Start playing the first song
   if (startingSong) {
     const filename = startingSong;
     const filePath = join(process.cwd(), playlistPath, filename ?? "");
@@ -140,5 +255,5 @@ export async function playAudioPlaylist(
     playRandomSong();
   }
 
-  return player; // Return player so you can control it externally if needed
+  return player;
 }
